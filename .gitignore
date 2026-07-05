@@ -1,0 +1,29 @@
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+.fvm/
+
+# Android
+android/.gradle/
+android/captures/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/**/GeneratedPluginRegistrant.java
+android/key.properties
+*.jks
+
+# Pre-compiled PocketBase binaries (downloaded by CI into jniLibs)
+android/app/src/main/jniLibs/*/
+!android/app/src/main/jniLibs/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.DS_Store

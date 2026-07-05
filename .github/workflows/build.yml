@@ -1,0 +1,135 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      pocketbase_version:
+        description: 'PocketBase version (e.g. v0.39.5) — leave empty for latest'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------- JDK ----------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ---------------- Flutter ----------------
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.24.5'
+          cache: true
+
+      # ---------------- Resolve PocketBase version ----------------
+      - name: Resolve latest PocketBase version
+        id: pbver
+        run: |
+          INPUT_VER="${{ inputs.pocketbase_version }}"
+          if [ -z "$INPUT_VER" ]; then
+            # Fetch latest release tag from GitHub API
+            VER=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/pocketbase/pocketbase/releases/latest \
+              | jq -r .tag_name)
+          else
+            VER="$INPUT_VER"
+          fi
+          if [ -z "$VER" ] || [ "$VER" = "null" ]; then
+            echo "Falling back to v0.39.5"
+            VER="v0.39.5"
+          fi
+          NUM="${VER#v}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "num=$NUM" >> "$GITHUB_OUTPUT"
+          echo "Resolved PocketBase: $VER (num=$NUM)"
+
+      # ---------------- Download pre-compiled binaries ----------------
+      # PocketBase ships statically-linked pure-Go binaries. Android's
+      # kernel is Linux, so a static linux/arm64 ELF runs natively on
+      # Android — we just need to ship it inside the APK as lib*.so so
+      # the package manager extracts it with the executable bit set.
+      - name: Download PocketBase binaries
+        env:
+          PB_VERSION: ${{ steps.pbver.outputs.version }}
+          PB_NUM: ${{ steps.pbver.outputs.num }}
+        run: |
+          set -euo pipefail
+          JNILIBS="android/app/src/main/jniLibs"
+          mkdir -p "$JNILIBS/arm64-v8a" "$JNILIBS/armeabi-v7a" "$JNILIBS/x86_64"
+
+          BASE="https://github.com/pocketbase/pocketbase/releases/download/${PB_VERSION}/pocketbase_${PB_NUM}_linux"
+
+          echo ":: Downloading arm64-v8a ::"
+          curl -fL "${BASE}_arm64.zip" -o pb_arm64.zip
+          unzip -o pb_arm64.zip pocketbase
+          mv pocketbase "$JNILIBS/arm64-v8a/libpocketbase.so"
+
+          echo ":: Downloading armeabi-v7a ::"
+          curl -fL "${BASE}_armv7.zip" -o pb_armv7.zip
+          unzip -o pb_armv7.zip pocketbase
+          mv pocketbase "$JNILIBS/armeabi-v7a/libpocketbase.so"
+
+          echo ":: Downloading x86_64 ::"
+          curl -fL "${BASE}_amd64.zip" -o pb_amd64.zip
+          unzip -o pb_amd64.zip pocketbase
+          mv pocketbase "$JNILIBS/x86_64/libpocketbase.so"
+
+          echo "=== jniLibs contents ==="
+          ls -lh "$JNILIBS"/*/
+          echo "=== verify ELF type ==="
+          file "$JNILIBS/arm64-v8a/libpocketbase.so"
+
+      # ---------------- Flutter build ----------------
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      # ---------------- Verify & upload ----------------
+      - name: Verify APK
+        run: |
+          ls -lh build/app/outputs/flutter-apk/app-release.apk
+          # List native libs inside the APK to confirm packaging
+          unzip -l build/app/outputs/flutter-apk/app-release.apk | grep 'lib/'
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocketbase-android-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Build Result" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**PocketBase version:** ${{ steps.pbver.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
+            SIZE=$(ls -lh build/app/outputs/flutter-apk/app-release.apk | awk '{print $5}')
+            echo "✅ APK built successfully ($SIZE)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ APK build failed" >> "$GITHUB_STEP_SUMMARY"
+          fi
