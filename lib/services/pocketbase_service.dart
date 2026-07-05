@@ -78,6 +78,10 @@ class PocketBaseService {
     _statusController.add(s);
   }
 
+  void _log(String line) {
+    _logController.add('$line\n');
+  }
+
   /// Resolve o caminho do binário dentro do diretório de native libs
   /// extraído do APK (/data/app/<pkg>/lib/<abi>/libpocketbase.so).
   Future<String> _resolveBinary() async {
@@ -96,10 +100,14 @@ class PocketBaseService {
     if (_status == ServerStatus.running) return 'already running';
 
     _setStatus(ServerStatus.starting);
-    _logController.add('[flutter] starting PocketBase...\n');
+    _log('[flutter] starting PocketBase...');
+
+    final List<String> stderrBuffer = [];
+    final List<String> stdoutBuffer = [];
 
     try {
       final binary = await _resolveBinary();
+      _log('[flutter] binary: $binary');
 
       // 1. Verify the binary exists and is executable
       final binFile = File(binary);
@@ -108,8 +116,29 @@ class PocketBaseService {
         return 'Binary not found at $binary';
       }
 
-      // 2. Create/upsert the superuser (admin) account
-      _logController.add('[flutter] upserting superuser ${config.adminEmail}...\n');
+      // 2. Pre-flight check: run --version to confirm the binary actually
+      //    executes on this device (catches permission / ABI / page-size
+      //    issues early with a clear message).
+      _log('[flutter] pre-flight: pocketbase --version');
+      final versionResult = await Process.run(
+        binary,
+        ['--version'],
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      ).timeout(const Duration(seconds: 5));
+      if (versionResult.exitCode != 0) {
+        _setStatus(ServerStatus.error);
+        final msg = 'Pre-flight --version failed (exit=${versionResult.exitCode}).\n'
+            'stdout: ${versionResult.stdout}\n'
+            'stderr: ${versionResult.stderr}';
+        _log('[flutter] $msg');
+        return msg;
+      }
+      _log('[pocketbase] ${versionResult.stdout.toString().trim()}');
+
+      // 3. Create/upsert the superuser (admin) account.
+      //    The superuser subcommand initialises the SQLite DB if needed.
+      _log('[flutter] upserting superuser ${config.adminEmail}...');
       final adminResult = await Process.run(
         binary,
         [
@@ -118,64 +147,93 @@ class PocketBaseService {
         ],
         stdoutEncoding: utf8,
         stderrEncoding: utf8,
-      );
+      ).timeout(const Duration(seconds: 15));
       if (adminResult.exitCode != 0) {
         _setStatus(ServerStatus.error);
         final err = (adminResult.stderr as String).trim();
-        _logController.add('[pocketbase] superuser error: $err\n');
-        return 'Failed to create admin: ${err.isEmpty ? adminResult.stdout : err}';
+        final out = (adminResult.stdout as String).trim();
+        final msg = 'superuser upsert failed (exit=${adminResult.exitCode})\n'
+            'stdout: $out\nstderr: $err';
+        _log('[flutter] $msg');
+        return msg;
       }
-      _logController
-          .add('[pocketbase] superuser ready: ${config.adminEmail}\n');
+      _log('[pocketbase] superuser ready: ${config.adminEmail}');
 
-      // 3. Start the server
-      _logController
-          .add('[flutter] launching: serve --listen=${config.listenAddr} --dir=$dataDir\n');
+      // 4. Start the HTTP server.
+      //    IMPORTANT: PocketBase v0.23+ renamed --listen → --http.
+      //    Using --listen will cause the process to print "unknown flag"
+      //    and exit immediately.
+      _log('[flutter] launching: serve --http=${config.listenAddr} --dir=$dataDir');
       _process = await Process.start(
         binary,
         [
           'serve',
-          '--listen', config.listenAddr,
+          '--http', config.listenAddr,
           '--dir', dataDir,
         ],
         workingDirectory: dataDir,
       );
 
-      // 4. Pipe stdout / stderr into the log stream
+      // 5. Pipe stdout / stderr into the log stream + buffers for diagnostics
       _process!.stdout
           .transform(utf8.decoder)
           .transform(const LineSplitter())
-          .listen((line) => _logController.add('$line\n'));
+          .listen((line) {
+        stdoutBuffer.add(line);
+        _log('[pocketbase] $line');
+      });
       _process!.stderr
           .transform(utf8.decoder)
           .transform(const LineSplitter())
-          .listen((line) => _logController.add('$line\n'));
+          .listen((line) {
+        stderrBuffer.add(line);
+        _log('[pocketbase:err] $line');
+      });
 
-      // 5. Monitor process exit
+      // 6. Monitor process exit
+      bool exited = false;
+      int exitCode = -1;
       _process!.exitCode.then((code) {
-        _logController.add('[flutter] PocketBase exited with code $code\n');
-        if (_status == ServerStatus.running || _status == ServerStatus.starting) {
+        exited = true;
+        exitCode = code;
+        _log('[flutter] PocketBase exited with code $code');
+        if (_status == ServerStatus.running ||
+            _status == ServerStatus.starting) {
           _setStatus(ServerStatus.stopped);
         }
         _process = null;
       });
 
-      // 6. Give the server a moment to bind
-      await Future.delayed(const Duration(milliseconds: 1200));
+      // 7. Poll for up to 4 seconds: either the process stays alive
+      //    (success) or it exits (failure → we report exit code + stderr).
+      for (int i = 0; i < 40; i++) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        if (exited) break;
+      }
 
-      // 7. Check if still alive
-      if (_process != null) {
+      if (!exited) {
         _setStatus(ServerStatus.running);
-        _logController.add('[flutter] server is up at ${config.listenAddr}\n');
+        _log('[flutter] server is up at ${config.listenAddr}');
         return null; // success
       } else {
         _setStatus(ServerStatus.error);
-        return 'Server exited unexpectedly during startup';
+        // Give the streams a moment to flush
+        await Future.delayed(const Duration(milliseconds: 200));
+        final stderrOut = stderrBuffer.join('\n').trim();
+        final stdoutOut = stdoutBuffer.join('\n').trim();
+        final msg = StringBuffer('PocketBase exited during startup (code=$exitCode).');
+        if (stdoutOut.isNotEmpty) msg.writeln('\n--- stdout ---\n$stdoutOut');
+        if (stderrOut.isNotEmpty) msg.writeln('\n--- stderr ---\n$stderrOut');
+        if (stdoutOut.isEmpty && stderrOut.isEmpty) {
+          msg.writeln('\n(no output — possible permission/page-size issue)');
+        }
+        return msg.toString();
       }
-    } catch (e) {
+    } catch (e, st) {
       _setStatus(ServerStatus.error);
-      _logController.add('[flutter] error: $e\n');
-      return e.toString();
+      _log('[flutter] exception: $e');
+      _log('[flutter] stack: $st');
+      return 'Exception: $e';
     }
   }
 
@@ -187,8 +245,7 @@ class PocketBaseService {
         _setStatus(ServerStatus.stopped);
         return null;
       }
-      _logController.add('[flutter] stopping PocketBase...\n');
-      // SIGTERM → graceful shutdown; fall back to SIGKILL after 3s
+      _log('[flutter] stopping PocketBase...');
       p.kill(ProcessSignal.sigterm);
       final exited = await p.exitCode.timeout(
         const Duration(seconds: 3),
@@ -197,7 +254,7 @@ class PocketBaseService {
           return -1;
         },
       );
-      _logController.add('[flutter] stopped (exit=$exited)\n');
+      _log('[flutter] stopped (exit=$exited)');
       _process = null;
       _setStatus(ServerStatus.stopped);
       return null;
@@ -207,7 +264,8 @@ class PocketBaseService {
     }
   }
 
-  Future<bool> isRunning() async => _process != null && _status == ServerStatus.running;
+  Future<bool> isRunning() async =>
+      _process != null && _status == ServerStatus.running;
 
   /// Versão embutida do PocketBase (lê de `--version`).
   Future<String> version() async {
@@ -216,7 +274,6 @@ class PocketBaseService {
       final binary = await _resolveBinary();
       final result = await Process.run(binary, ['--version']);
       final out = (result.stdout as String).trim();
-      // "PocketBase version 0.39.5"  →  "0.39.5"
       final m = RegExp(r'(\d+\.\d+\.\d+)').firstMatch(out);
       _cachedVersion = m?.group(1) ?? 'unknown';
     } catch (_) {
